@@ -4,6 +4,7 @@ import requests
 from tqdm import tqdm
 import copy
 import argparse
+from openai import OpenAI
 from utils.search_engine import *
 from transformers import (
     BertTokenizer, 
