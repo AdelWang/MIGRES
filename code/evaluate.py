@@ -10,6 +10,7 @@ import concurrent.futures
 import time
 import datetime
 import requests
+from openai import OpenAI
 
 
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
