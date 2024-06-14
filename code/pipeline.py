@@ -52,38 +52,44 @@ def getRetrieval(path, data):
     return
 
 
-def send_post_request(prompt_str, model_name, num_return=1):
-    url = "your api url"
-    headers = {
-        "your headers"
-    }
-    if num_return > 1:
-        top_p = 0.9
-        presence_penalty = 1.0
-        frequency_penalty = 1.0
-    else:
-        top_p = 1.0
-        presence_penalty = 0.0
-        frequency_penalty = 0.0
-    data = {
-        "model": model_name,
-        "messages": [{"role": "system", "content": "You are ChatGPT, a large language model trained by OpenAI. Answer as concisely as possible. Knowledge cutoff: 01/01/2022 Current date: 03/24/2024"}, {"role": "user", "content": prompt_str}],
-        "n": num_return,
-        "top_p": top_p,
-        "presence_penalty": presence_penalty,
-        "frequency_penalty": frequency_penalty,
-        "response_format": { "type": "json_object" }
-    }
-    response = requests.post(url, headers=headers, data=json.dumps(data))
+def send_post_request(prompt_str):
+    client = OpenAI(
+        api_key = "",
+        base_url = ""
+    )
+    response = None
+    model = model_name
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": 'You are ChatGPT, a model trained by OpenAI.}'},
+                {
+                    "role": "user",
+                    "content": prompt_str
+                }
+            ],
+            # response_format={"type": "json_object"},
+            stream=False
+        )
+    except Exception as e:
+        print(e)
+    return _response_process(response)
 
-    if response.status_code == 200:
-        gpt_res = response.json()
-        res = gpt_res['choices']
-        res = [r['message']['content'] for r in res]
-        
-        return res
+def _response_process(response):
+    result = {
+        'len': 0,
+        'res': None
+    }
+
+    if response != None:
+        choices = response.choices
+        result['len'] = len(choices)
+        result['res'] = choices[0].message.content
     else:
-        return ''
+        result['len'] = -1
+    
+    return result['res']
 
 def process_item_to_ask(item, model_name, num_return):
     try:

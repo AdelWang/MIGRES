@@ -50,39 +50,44 @@ parser.add_argument("--data_path", type=str, required=True)
 args = parser.parse_args()
 prompt_acc = '''In the following task, you are given a Question, a model Prediction for the Question, and a Ground-truth Answer to the Question. You should decide whether the model Prediction implies the Ground-truth Answer.\n\nQuestion\n{question}\n\nPrediction\n{model_output}\n\nGround-truth Answer\n{answer}\n\nDoes the Prediction imply the Ground-truth Answer? Output Yes or No:'''
 
-def send_post_request(prompt_str, model_name, num_return=1):
+def send_post_request(prompt_str):
+    client = OpenAI(
+        api_key = "",
+        base_url = ""
+    )
+    response = None
+    model = model_name
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": 'You are ChatGPT, a model trained by OpenAI.}'},
+                {
+                    "role": "user",
+                    "content": prompt_str
+                }
+            ],
+            # response_format={"type": "json_object"},
+            stream=False
+        )
+    except Exception as e:
+        print(e)
+    return _response_process(response)
 
-    url = "your url"
-    headers = {
-        "your headers"
+def _response_process(response):
+    result = {
+        'len': 0,
+        'res': None
     }
-    if num_return > 1:
-        top_p = 0.9
-        presence_penalty = 1.0
-        frequency_penalty = 1.0
-    else:
-        top_p = 1.0
-        presence_penalty = 0.0
-        frequency_penalty = 0.0
-    data = {
-        "model": model_name,
-        "messages": [{"role": "user", "content": prompt_str}],
-        "n": num_return,
-        "top_p": top_p,
-        "presence_penalty": presence_penalty,
-        "frequency_penalty": frequency_penalty,
-        "response_format": { "type": "json_object" }
-    }
-    response = requests.post(url, headers=headers, data=json.dumps(data))
 
-    if response.status_code == 200:
-        gpt_res = response.json()
-        res = gpt_res['choices']
-        res = [r['message']['content'] for r in res]
-        
-        return res
+    if response != None:
+        choices = response.choices
+        result['len'] = len(choices)
+        result['res'] = choices[0].message.content
     else:
-        return ''
+        result['len'] = -1
+    
+    return result['res']
 
 def process_item_to_ask(item, model_name, num_return):
     try:
