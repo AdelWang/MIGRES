@@ -53,7 +53,7 @@ def getRetrieval(path, data):
     return
 
 
-def send_post_request(prompt_str):
+def send_post_request(prompt_str,model_name,num_return):
     client = OpenAI(
         api_key = "",
         base_url = ""
@@ -64,13 +64,13 @@ def send_post_request(prompt_str):
         response = client.chat.completions.create(
             model=model,
             messages=[
-                {"role": "system", "content": 'You are ChatGPT, a model trained by OpenAI.}'},
+                {"role": "system", "content": 'You are ChatGPT, a model trained by OpenAI.'},
                 {
                     "role": "user",
                     "content": prompt_str
                 }
             ],
-            # response_format={"type": "json_object"},
+            n=num_return,
             stream=False
         )
     except Exception as e:
