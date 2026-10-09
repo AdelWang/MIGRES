@@ -1,4 +1,6 @@
 import json
+import ast
+import re
 import os
 import requests
 from tqdm import tqdm
@@ -53,44 +55,32 @@ def getRetrieval(path, data):
     return
 
 
-def send_post_request(prompt_str,model_name,num_return):
-    client = OpenAI(
-        api_key = "",
-        base_url = ""
-    )
-    response = None
-    model = model_name
+def send_post_request(prompt_str, model_name, num_return=1):
+    """Return a list of complete completions, including when n=1."""
     try:
+        kwargs = {}
+        if os.getenv("OPENAI_BASE_URL"):
+            kwargs["base_url"] = os.environ["OPENAI_BASE_URL"]
+        client = OpenAI(**kwargs)  # Reads OPENAI_API_KEY from the environment.
         response = client.chat.completions.create(
-            model=model,
+            model=model_name,
             messages=[
-                {"role": "system", "content": 'You are ChatGPT, a model trained by OpenAI.'},
-                {
-                    "role": "user",
-                    "content": prompt_str
-                }
+                {"role": "system", "content": "You are ChatGPT, a model trained by OpenAI."},
+                {"role": "user", "content": prompt_str},
             ],
             n=num_return,
-            stream=False
+            stream=False,
         )
-    except Exception as e:
-        print(e)
-    return _response_process(response)
+        return _response_process(response)
+    except Exception as exc:
+        print(f"Model request failed: {exc}")
+        return []
 
 def _response_process(response):
-    result = {
-        'len': 0,
-        'res': None
-    }
-
-    if response != None:
-        choices = response.choices
-        result['len'] = len(choices)
-        result['res'] = choices[0].message.content
-    else:
-        result['len'] = -1
-    
-    return result['res']
+    if response is None:
+        return []
+    return [choice.message.content for choice in response.choices
+            if isinstance(choice.message.content, str) and choice.message.content.strip()]
 
 def process_item_to_ask(item, model_name, num_return):
     try:
@@ -104,7 +94,7 @@ def process_item_to_ask(item, model_name, num_return):
 
     except Exception as e:
         print(e)
-        item['gpt_out'] = ''
+        item['gpt_out'] = []
         return item
 
 def gpt_batch_request(all_data, num_workers, model_name, num_return=1):
@@ -183,17 +173,53 @@ def clusterFilter(inputs, num_cluster=3):
     labels_count = Counter(labels)
     labels_index = sorted(labels_count.items(), key=lambda x: x[1], reverse=True)
     if len(labels_index) < 3:
-        remain_labels = [i for i in range(len(labels_index))]
+        remain_labels = [label for label, count in labels_index]
     else:
         remain_labels = [labels_index[0][0]] if labels_index[1][1] == labels_index[2][1] else [labels_index[0][0], labels_index[1][0]]
 
     distances = cdist(text_vectors, cluster_centers, 'euclidean')
     for l in remain_labels:
-        closest_distances = distances[np.arange(text_vectors.shape[0]), l * np.ones_like(labels)]
-        closest_points_indice = np.argsort(closest_distances)[:1]
-        choosen_text = inputs[int(closest_points_indice)]
+        members = np.flatnonzero(labels == l)
+        closest_index = members[np.argmin(distances[members, l])]
+        choosen_text = inputs[int(closest_index)]
         final_res.append(choosen_text)
     return final_res
+
+
+
+def parse_model_object(text):
+    text = text.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        text = "\n".join(lines[1:-1]) if lines[-1].strip() == "```" else "\n".join(lines[1:])
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return ast.literal_eval(text)
+
+
+class ModelEngine:
+    def __init__(self, args, world_size):
+        self.args = args
+        self.model = AutoModelForCausalLM.from_pretrained(
+            args.model_name_or_path, torch_dtype=torch.bfloat16, device_map="auto")
+        self.model.eval()
+        self.tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, padding_side="left")
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
+    def inference(self, inputs, num_return=1):
+        final_out = {}
+        for question, prompt in inputs.items():
+            encoded = self.tokenizer(prompt, return_tensors="pt", truncation=True,
+                                     max_length=4096).to(self.model.device)
+            with torch.inference_mode():
+                output = self.model.generate(
+                    **encoded, max_new_tokens=256, num_return_sequences=num_return,
+                    do_sample=num_return > 1, pad_token_id=self.tokenizer.pad_token_id)
+            generated = output[:, encoded["input_ids"].shape[1]:]
+            final_out[question] = self.tokenizer.batch_decode(generated, skip_special_tokens=True)
+        return final_out
 
 
 class RetGBatched:
@@ -285,7 +311,7 @@ Extracted span:'''
         self.instruction_query_tail = ""
              
         self.search_url = "https://api.bing.microsoft.com/v7.0/search"
-        self.subscription_key = "your subscription_key"
+        self.subscription_key = os.getenv("BING_SEARCH_KEY", "")
        
         ## instruction for each single prompt
         self.main_text = defaultdict(str)
@@ -306,17 +332,21 @@ Extracted span:'''
         self.main_passages = defaultdict(list)
         ## refresh each time
         self.leaf_passages = defaultdict(list)
+        self.prompt_passages = defaultdict(list)
         self.retrieval_trace = defaultdict(list)
         
         
     def promptPassages(self, ori_question, first_question, passage_list):
         snippet = []
         num_ret = 0
-        this_question = [first_question[0]]
-        previous_question, ori_context = None, None
+        this_question = [first_question] if isinstance(first_question, str) else list(first_question[:1])
+        previous_question = None
         new_main_passages, question_list = [], set()
+        shown_passages = []
         for i, p in enumerate(passage_list):
+            ori_context = None
             title = None
+            question = this_question[0]
             drop_ = False
             if isinstance(p, dict):
                 context = p['snippet'] if 'snippet' in p else p['text']
@@ -333,26 +363,30 @@ Extracted span:'''
                 if self.args.summ_snippet == "summ":
                     prompt_to_refine = self.instruction_summ.format(QUESTION=question, TITLE=title, TEXT=context)
                     context = self.askGPT({question: prompt_to_refine})
-                    new_main_passages.append(context[question][0])
+                    if question in context and context[question]:
+                        new_main_passages.append(context[question][0])
                     self.extra_call += 1
                 elif self.args.summ_snippet == "snippet":
                     prompt_to_refine = self.instruction_snippet.format(QUESTION=question, TITLE=title, TEXT=context)
                     context = self.askGPT({question: prompt_to_refine})
-                    new_main_passages.append(context[question][0])
+                    if question in context and context[question]:
+                        new_main_passages.append(context[question][0])
                     self.extra_call += 1
                 else:
                     pass
             else:
                 # GPT knowledge
                 context = p
-                filter_str = ['sorry', '2022', "have no specific iinformation", "no publicly available information"]
+                filter_str = ['sorry', '2022', "have no specific information", "no publicly available information"]
                 for str_ in filter_str:
                     if str_ in context.lower():
                         drop_ = True
                 question = this_question[0]
             if drop_:
                 continue
-            if self.args.summ_snippet is not None:
+            if isinstance(context, dict) and self.args.summ_snippet is not None:
+                if question not in context or not context[question]:
+                    continue
                 this_snippet = context[question][0]
             else:
                 this_snippet = context
@@ -366,6 +400,7 @@ Extracted span:'''
                 continue
             this_snippet = f'''(Title: {title}) {this_snippet}'''
             snippet.append(this_snippet)
+            shown_passages.append(p)
             num_ret += 1
             if num_ret == self.args.top_k:
                 break
@@ -380,6 +415,7 @@ Extracted span:'''
         res = res.replace("<b>", "")
         res = res.replace("</b>", "")
         res = res.replace("<br>", "").strip().rstrip()
+        self.prompt_passages[ori_question] = shown_passages
         return res, question_list
     
     def promptMain(self, num_iter=0):
@@ -393,12 +429,12 @@ Extracted span:'''
             if "final_res" in d or "fail" in d:
                 continue
             ori_question = d['question']
-            if len(self.known_info[ori_question]) == len(self.known_info_backup[ori_question]) and self.step > 1:
+            if len(self.known_info[ori_question]) == len(self.known_info_backup[ori_question]) and self.step > 1 and num_iter < self.max_iter:
                 ## no new information is added
                 d['history'][f"step {self.step}-main"] = "None"
                 continue
             if num_iter == 0 or self.max_iter == 0:
-                passages, question = self.promptPassages(ori_question, ori_question, self.main_passages[ori_question])
+                passages, question = self.promptPassages(ori_question, [ori_question], self.main_passages[ori_question])
                 if passages == "":
                     passages = "Passages 0: None"
                 inputs = f'''{passages}\nQuestion: {ori_question}'''
@@ -525,7 +561,7 @@ Extracted span:'''
             map_dict_sub = {v[i]: k for i in range(len(v))}
             map_dict = dict(map_dict, **map_dict_sub)
 
-        question = [{'query': v} for k, v in question.items()]
+        question = [{'query': v, 'ori_question': k} for k, v in question.items()]
 
         num_process = self.args.num_process
         pool = multiprocessing.pool.ThreadPool(processes=num_process)
@@ -537,6 +573,7 @@ Extracted span:'''
                                 data=question)
         results = pool.map(search_all_part, sampleData)
         pool.close()
+        pool.join()
 
         output_data = []
         for result in results:
@@ -546,7 +583,7 @@ Extracted span:'''
             new_query = d['query']
             if isinstance(new_query, list) and len(new_query) > 0:
                 new_query = new_query[0]
-            ori_question = map_dict[new_query]
+            ori_question = d['ori_question']
             output_data_new[ori_question] = d['ctxs']
         if rerank:
             ret_res = self.reranker.sentenceRerank(output_data_new, original_questions, self.history_passages)
@@ -557,17 +594,27 @@ Extracted span:'''
         return ret_res, output_data_new
         
     def search_bing(self, questions, searcher_index=0, rerank=True):
-        all_web_knowledge = {}
-        for ori_question, search_term in tqdm(questions.items()):
-            headers = {"Ocp-Apim-Subscription-Key": self.subscription_key}
-            params = {"q": search_term, "textDecorations": True, "textFormat": "HTML"}
-            response = requests.get(self.search_url, headers=headers, params=params)
-            response.raise_for_status()
-            search_results = response.json()
-            web_knowledge = search_results['webPages']['value']
-            all_web_knowledge[ori_question] = web_knowledge
-
-        return all_web_knowledge
+        if not self.subscription_key:
+            raise ValueError("Set BING_SEARCH_KEY for the Bing search backend.")
+        passages = {}
+        for original, queries in questions.items():
+            queries = [queries] if isinstance(queries, str) else queries
+            contexts, seen = [], set()
+            for query in queries:
+                response = requests.get(self.search_url,
+                    headers={"Ocp-Apim-Subscription-Key": self.subscription_key},
+                    params={"q": query, "textDecorations": False, "textFormat": "Raw"}, timeout=60)
+                response.raise_for_status()
+                for hit in response.json().get("webPages", {}).get("value", []):
+                    text = hit.get("snippet", "")
+                    if text and text not in seen:
+                        contexts.append({"title": hit.get("name", ""), "text": text})
+                        seen.add(text)
+            passages[original] = contexts
+        if not rerank:
+            return None, passages
+        ranked = self.reranker.sentenceRerank(passages, questions, self.history_passages)
+        return self.QueryForward(ranked, questions, passages), passages
 
     def search_dense(self, questions, searcher_index=0, rerank=True):
         if isinstance(self.searcher, list):
@@ -583,7 +630,7 @@ Extracted span:'''
             batch_list = new_queries[i: i + self.args.num_process]
             for b in batch_list:
                 batch.extend(b)
-            psg_ids = searcher.get_top_docs(batch, top_docs=args.num_dense)
+            psg_ids = searcher.get_top_docs(batch, top_docs=self.args.num_dense)
             all_psg_ids.extend(psg_ids)
         passages = defaultdict(list)
         new_all_psg_ids = []
@@ -600,6 +647,7 @@ Extracted span:'''
         for index, ids in enumerate(new_all_psg_ids):
             ori_question = ori_questions[index]
             record_passages = set()
+            passages[ori_question] = []
             for id_ in ids:
                 id_ = str(id_)
                 if isinstance(self.wikiData, dict):
@@ -631,7 +679,7 @@ Extracted span:'''
         for k, v in raw_bm25.items():
             psg_set = set()
             psg_list = []
-            v_all = v + raw_dense[k]
+            v_all = v + raw_dense.get(k, [])
             for ctx in v_all:
                 if isinstance(ctx, dict):
                     text = ctx['text']
@@ -662,19 +710,26 @@ Extracted span:'''
             return self.search_dense(questions, rerank=rerank)
     
     def askGPT(self, inputs, num_return=1):
+        if not inputs:
+            return {}
         if self.args.model_name_or_path is None:
-            all_gpt_outs = gpt_batch_request(inputs, num_workers=50, model_name=self.model_name, num_return=num_return)
-            ## gpt might fail to call api, we need to filter it out
-            for d in self.data:
-                ori_question = d['question']
-                if ori_question not in all_gpt_outs:
-                    continue
-                if all_gpt_outs[ori_question] == "":
-                    all_gpt_outs.pop(ori_question)
-                    d['fail'] = True
+            outputs = gpt_batch_request(inputs, num_workers=50,
+                                        model_name=self.model_name, num_return=num_return)
         else:
-            all_gpt_outs = self.chatModel.inference(inputs)
-        return all_gpt_outs
+            outputs = self.chatModel.inference(inputs, num_return=num_return)
+        normalized = {}
+        for question in inputs:
+            responses = outputs.get(question)
+            if isinstance(responses, str):
+                responses = [responses]
+            responses = [r for r in (responses or []) if isinstance(r, str) and r.strip()]
+            if responses:
+                normalized[question] = responses
+            else:
+                for record in self.data:
+                    if record['question'] == question:
+                        record['fail'] = True
+        return normalized
     
     def extractNewinfo(self, all_gpt_out, info_type="main", strict=True, iteration=1):
         # all_gpt_out = {ori_question: gpt_out}
@@ -739,7 +794,7 @@ Extracted span:'''
                                 nli_score = 1
                                 if self.nli_model is not None:
                                     nli_score = 0
-                                    for i, p in enumerate(self.leaf_passages[ori_question]):
+                                    for i, p in enumerate(self.prompt_passages[ori_question]):
                                         if i in info["support_passages"]:
                                             if isinstance(p, list):
                                                 context, score, question, title, ori_context = p
@@ -752,7 +807,7 @@ Extracted span:'''
                                         self.known_info[ori_question].append(str(info["info"]))
                                         useful_passage_index.extend(info["support_passages"])
                     useful_passage_index = set(useful_passage_index)
-                    for i, p in enumerate(self.leaf_passages[ori_question]):
+                    for i, p in enumerate(self.prompt_passages[ori_question]):
                         if i in useful_passage_index:
                             # print("*****    Main passages added *****")
                             self.main_passages[ori_question].append(p)
@@ -831,7 +886,7 @@ Extracted span:'''
         useful_passage_index = []
         missing_info, answer_text, answer_confidence, explanation_info = "", "", "", ""
         try:
-            record_res = eval(gpt_out)
+            record_res = parse_model_object(gpt_out)
             if "missing_information" not in record_res:
                 record_res["missing_information"] = "None"
         except:
@@ -882,10 +937,10 @@ Extracted span:'''
 
     def extractLeaf(self, gpt_out):
         try:
-            gpt_out = eval(gpt_out)
-            gpt_out = gpt_out["useful_information"]
+            parsed = parse_model_object(gpt_out)
+            records = parsed["useful_information"]
             record_res = []
-            for info in gpt_out:
+            for info in records:
                 if "support_passages" not in info:
                     continue
                 elif len(info["support_passages"]) == 0:
@@ -943,6 +998,7 @@ Extracted span:'''
         while True:
             # print(f"Current iteration self.step: {num_iter}")
             if num_iter >= self.max_iter:
+                self.promptMain(num_iter=self.max_iter)
                 main_gpt_out = self.askGPT(self.main_text, num_return=self.args.num_return)
                 for d in self.data:
                     if "final_res" in d or "fail" in d:
@@ -967,9 +1023,9 @@ Extracted span:'''
                     d['final_res'] = extract_res
                     d['known information'] = self.known_info[ori_question]
                     if self.max_iter == 0:
-                        support_passages = extract_res['support_passages']
+                        support_passages = extract_res.get('support_passages', [])
                         new_main_passages = []
-                        main_passages = self.main_passages[ori_question]
+                        main_passages = self.prompt_passages[ori_question]
                         for i, p in enumerate(main_passages):
                             if i in support_passages:
                                 new_main_passages.append(p)
@@ -1017,6 +1073,7 @@ Extracted span:'''
             self.step += 1
             print(f"step: {self.step}: Jump to the leaf for knowledge retrieval")
             ranked_leaf_passages, raw_leaf_passages = self.search(new_query)
+            self.leaf_passages = defaultdict(list)
             for k, v in ranked_leaf_passages.items():
                 self.leaf_passages[k] = v
                 self.retrieval_trace[k].extend(v)
@@ -1042,7 +1099,8 @@ Extracted span:'''
     def retrieval(self):
         ori_questions = {d['question']: [d['question']] for d in self.data}
         print(f"Processing retrieval, total data {len(self.data)}")
-        self.main_passages, raw_main_passages = self.search(ori_questions, rerank=False)
+        _, raw_main_passages = self.search(ori_questions, rerank=False)
+        self.main_passages = raw_main_passages
         ## get retrieval results after rerank
         for d in self.data:
             d['retrieval_res'] = raw_main_passages[d['question']]
@@ -1079,7 +1137,10 @@ parser.add_argument("--encoder_path", type=str, default=None)
 parser.add_argument("--encoded_data_path", type=str, default=None)
 parser.add_argument("--model_name", type=float, default=3.5)
 parser.add_argument("--num_return", type=int, default=1)
-parser.add_argument("--ranker_model_path", type=str, default="BAAI/bge-rerank-base")
+parser.add_argument("--api_model", type=str, default=None, help="Exact model identifier; overrides --model_name.")
+parser.add_argument("--ignore_string", type=str, default="")
+parser.add_argument("--num_queries", type=int, default=-1)
+parser.add_argument("--ranker_model_path", type=str, default="BAAI/bge-reranker-base")
 parser.add_argument("--normalize", action="store_true")
 parser.add_argument("--add_demon", action="store_true")
 parser.add_argument("--sentRerank", action="store_true")
@@ -1097,50 +1158,22 @@ parser.add_argument("--ctx_sources", type=str, default=None)
 args = parser.parse_args()
 
 if __name__ == "__main__":
-    if args.aug:
-        bm25_dict = {
-            "wikimultihop": "bm25_index_of_augmented_corpus",
-            "odqa": "bm25_index_of_augmented_corpus",
-            'hotpot': "bm25_index_of_augmented_corpus"",
-            "musique": "bm25_index_of_augmented_corpus",
-            "strategy": "bm25_index_of_augmented_corpus"
-        }
-    else:
-        bm25_dict = {
-            "wikimultihop": "bm25_index_of_original_corpus",
-            "odqa": "bm25_index_of_original_corpus",
-            'hotpot': "bm25_index_of_original_corpus"",
-            "musique": "bm25_index_of_original_corpus",
-            "strategy": "bm25_index_of_original_corpus"
-        }
-    dense_dict = {
-        "wikimultihop": "",
-        "odqa": "",
-        "hotpot": "",
-        "musique": "",
-        "strategy": ""
-    }
-    source_dict = {
-        "wikimultihop": "2018_wikipedia_dump",
-        "odqa": "2018_wikipedia_dump",
-        "hotpot": "2017_wikipedia_dump",
-        "musique": "2021_wikipedia_dump",
-        "strategy": "2021_wikipedia_dump"
-    }
-    for k in bm25_dict.keys():
-        if k in args.data_path:
-            args.index_dir = bm25_dict[k]
-            args.encoded_data_path = dense_dict[k]
-            args.ctx_sources = source_dict[k]
+    # Supply the appropriate original/augmented corpus paths explicitly.
+    if args.num_return < 1 or args.max_iter < 0 or args.top_k < 1 or args.num_process < 1:
+        parser.error("num_return, top_k and num_process must be positive; max_iter must be nonnegative")
+    if args.search_type in ("bm25", "mixture") and not args.index_dir:
+        parser.error("--index_dir is required for BM25 retrieval")
+    if args.search_type in ("dense", "mixture") and not all(
+            [args.encoder_path, args.encoded_data_path, args.ctx_sources]):
+        parser.error("Dense retrieval requires --encoder_path, --encoded_data_path and --ctx_sources")
     print(args)
     if args.add_demon:
         assert args.demon_path is not None
-    args.query_prompt = "Generate a representation for this sentence to be used to retrieve related documents: " if "bge" in args.encoder_path else args.query_prompt
-    choosed_model_name = "gpt-4-0613" if args.model_name == 4 else "gpt-3.5-turbo-1106"
+    args.query_prompt = "Generate a representation for this sentence to be used to retrieve related documents: " if "bge" in (args.encoder_path or "").lower() else args.query_prompt
+    choosed_model_name = args.api_model or ("gpt-4-0613" if args.model_name == 4 else "gpt-3.5-turbo-1106")
     print("Backbone model: ", choosed_model_name)
-    if not args.retrieval:
-        save_dir = args.save_path.split("output_")[0]
-        os.makedirs(save_dir, exist_ok=True)
+    save_dir = os.path.dirname(os.path.abspath(args.save_path))
+    os.makedirs(save_dir, exist_ok=True)
     finished_data =[]
     try:
         data = json.load(open(args.data_path))
@@ -1227,3 +1260,4 @@ if __name__ == "__main__":
     finished_data.extend(iter_data.data)
     with open(args.save_path, 'w', encoding='utf-8') as f:
         f.write(json.dumps(finished_data, indent=5, ensure_ascii=False))
+        
