@@ -7,7 +7,7 @@ import math
 import pandas as pd
 
 def process_data(data, index):
-    f = open(os.path.join(save_dir, f"psg_{index}.jsonl"), 'a', encoding='utf-8')
+    f = open(os.path.join(save_dir, f"psg_{index}.jsonl"), 'w', encoding='utf-8')
     if isinstance(data, list):
         data = [json.loads(d) for d in data]
         for d in tqdm(data):
@@ -19,7 +19,7 @@ def process_data(data, index):
     elif isinstance(data, pd.DataFrame):
         for row in tqdm(data.index):
             context = data.loc[row]["text"]
-            id_ = data.loc[row]["id"]
+            id_ = str(data.loc[row]["id"])
             title = data.loc[row]["title"]
             new_d = {'id': id_, "title": title, "contents": context}
             f.writelines([json.dumps(new_d, ensure_ascii=False), '\n'])
@@ -51,16 +51,16 @@ def data_split(paths, save_dir):
         paths = [paths]
     for index, p in enumerate(paths):
         save_names = p.split(".jsonl")[0].split("/")[-1]
-        data = open(p).readlines()
+        with open(p, encoding='utf-8') as source:
+            data = source.readlines()
         data = [json.loads(d) for d in data]
         lengths = len(data) // 10 + 1 
         for i in range(10):
             this_save_name = save_names + f"_{i}.jsonl"
-            f = open(os.path.join(save_dir, this_save_name), 'a', encoding='utf-8')
-            for idx in range(0, len(data), lengths):
-                sub_data = data[idx: idx + lengths]
-                for d in tqdm(sub_data):
-                    f.writelines([json.dumps(d, ensure_ascii=False), '\n'])
+            f = open(os.path.join(save_dir, this_save_name), 'w', encoding='utf-8')
+            sub_data = data[i * lengths: (i + 1) * lengths]
+            for d in tqdm(sub_data):
+                f.writelines([json.dumps(d, ensure_ascii=False), '\n'])
             f.close()
     return "Finish"
 
