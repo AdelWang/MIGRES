@@ -21,7 +21,6 @@ import time
 from tqdm import tqdm
 import pandas as pd
 from collections import defaultdict
-import deepspeed
 
 from transformers import BertTokenizer, AutoTokenizer, AutoModelForSequenceClassification, AutoModelForCausalLM
 from omegaconf import DictConfig, OmegaConf
@@ -52,7 +51,7 @@ def get_all_passages_multi(all_data, num_workers=32):
         return pd.read_table(all_data)
     sub_data = []
     res_all = []
-    sub_length = len(all_data) // num_workers
+    sub_length = (len(all_data) + num_workers - 1) // num_workers
     for w in range(num_workers):
         sub_wikidata = all_data[w * sub_length: (w + 1) * sub_length]
         sub_data.append(sub_wikidata)
@@ -129,7 +128,7 @@ def search_all(process_idx, num_process, searcher, data, args):
     for i, data_i in enumerate(data):
         if i % num_process != process_idx:
             continue
-        if i > args.num_queries and args.num_queries != -1:
+        if args.num_queries != -1 and i >= args.num_queries:
             break
 
         output_i = searcher.perform_search(data_i, args.num_bm25)
@@ -225,7 +224,6 @@ class DenseFlatIndexer(DenseIndexer):
             vectors = np.concatenate(vectors, axis=0)
             total_data = self._update_id_mapping(db_ids)
             self.index.add(vectors)
-            # self.index.add_with_ids(vectors, db_ids)
             logger.info("data indexed %d", total_data)
 
         indexed_cnt = len(self.index_id_to_db_id)
@@ -233,9 +231,15 @@ class DenseFlatIndexer(DenseIndexer):
 
     def search_knn(self, query_vectors: np.array, top_docs: int) -> List[Tuple[List[object], List[float]]]:
         scores, indexes = self.index.search(query_vectors, top_docs)
-        # convert to external ids
-        db_ids = [[self.index_id_to_db_id[i] for i in query_top_idxs] for query_top_idxs in indexes]
-        result = [(db_ids[i], scores[i]) for i in range(len(db_ids))]
+        # FAISS pads results with -1 when fewer than top_docs are available.
+        # Python's negative indexing would otherwise silently select the last doc.
+        result = []
+        for query_indexes, query_scores in zip(indexes, scores):
+            valid = [(self.index_id_to_db_id[int(i)], score)
+                     for i, score in zip(query_indexes, query_scores)
+                     if 0 <= int(i) < len(self.index_id_to_db_id)]
+            result.append(([doc_id for doc_id, _ in valid],
+                           [score for _, score in valid]))
         return result
 
     def get_index_name(self):
@@ -319,17 +323,15 @@ class LocalFaissRetriever(DenseRetriever):
         results = self.index.search_knn(query_vectors, top_docs)
         logger.info("index search time: %f sec.", time.time() - time0)
         psg_ids = [results[i][0] for i in range(len(results))]
-        # scores = results[0][1]
-        # print("*********  dense res check:", psg_ids, '\n', scores)
         return psg_ids
 
 class Reranker:
     def __init__(self, args):
         self.args = args
         self.model = AutoModelForSequenceClassification.from_pretrained(self.args.ranker_model_path, device_map="auto")
-        # self.model, *_ = deepspeed.initialize(model=model, config=deepspeed_config)
+        self.model.eval()
         self.tokenizer = AutoTokenizer.from_pretrained(self.args.ranker_model_path)
-        self.sent_tokenizer = nltk.data.load('tokenization/punkt/english.pickle')
+        self.sent_tokenizer = nltk.data.load('tokenizers/punkt/english.pickle') if args.sentRerank else None
  
     def process_data(self, this_question, passages, new_questions):
         pairs = []
@@ -363,7 +365,7 @@ class Reranker:
             inputs = inputs.to(self.model.device)
             with torch.no_grad():
                 scores = self.model(**inputs).logits.view(-1, ).float()
-            scores = scores.reshape(num_questions, -1).sum(0)
+            scores = scores.reshape(-1, num_questions).sum(1)
             sorted_indices = torch.argsort(scores, descending=True)
             for index in sorted_indices:
                 index = int(index)
@@ -379,12 +381,13 @@ class Reranker:
                 {"title": c['title'], "text": c["text"].replace("\n", "").replace("<br>", "").replace("<b>", "").replace("</b>", "")}
                 for c in raw_context
             ]
-            # print(len(context))
             context_title_map = {}
             for c in context:
                 context_title_map[c["text"]] = c["title"]
             generated_questions = questions[ori_question]
             all_choosed[ori_question] = []
+            if not context or not generated_questions:
+                continue
             choosed_context, choosed_snippet = {}, {}
             snippet_context_map = {}
             for question in generated_questions:
@@ -422,6 +425,8 @@ class Reranker:
                     previous_sentence = cutted_sentences[0]
                     for s in cutted_sentences[1:]:
                         s = s.strip().rstrip()
+                        if not s:
+                            continue
                         if not s[0].isupper():
                             previous_sentence = previous_sentence + " " + s
                         else:
