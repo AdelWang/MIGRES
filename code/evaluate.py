@@ -1,5 +1,6 @@
 import argparse
 import json
+import ast
 import os
 from tqdm import tqdm
 import string
@@ -47,32 +48,21 @@ def rouge_calculation(hypotheses, references):
 
 parser = argparse.ArgumentParser(description='')
 parser.add_argument("--data_path", type=str, required=True)
+parser.add_argument("--api_model", default="gpt-3.5-turbo-1106")
+parser.add_argument("--aliases_path", default=None, help="Optional JSONL answer-ID aliases")
         
 args = parser.parse_args()
 prompt_acc = '''In the following task, you are given a Question, a model Prediction for the Question, and a Ground-truth Answer to the Question. You should decide whether the model Prediction implies the Ground-truth Answer.\n\nQuestion\n{question}\n\nPrediction\n{model_output}\n\nGround-truth Answer\n{answer}\n\nDoes the Prediction imply the Ground-truth Answer? Output Yes or No:'''
 
-def send_post_request(prompt_str):
-    client = OpenAI(
-        api_key = "",
-        base_url = ""
-    )
-    response = None
-    model = model_name
-    try:
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": 'You are ChatGPT, a model trained by OpenAI.}'},
-                {
-                    "role": "user",
-                    "content": prompt_str
-                }
-            ],
-            # response_format={"type": "json_object"},
-            stream=False
-        )
-    except Exception as e:
-        print(e)
+def send_post_request(prompt_str, model_name, num_return=1):
+    kwargs = {}
+    if os.getenv("OPENAI_BASE_URL"):
+        kwargs["base_url"] = os.environ["OPENAI_BASE_URL"]
+    client = OpenAI(**kwargs)
+    response = client.chat.completions.create(
+        model=model_name,
+        messages=[{"role": "user", "content": prompt_str}],
+        n=num_return, stream=False)
     return _response_process(response)
 
 def _response_process(response):
@@ -139,6 +129,20 @@ def normalize_answer(s):
     def lower(text):
         return text.lower()
     return white_space_fix(remove_articles(remove_punc(lower(s))))
+
+def load_records(path):
+    with open(path, encoding='utf-8') as source:
+        text = source.read()
+    try:
+        records = json.loads(text)
+    except json.JSONDecodeError:
+        records = [json.loads(line) for line in text.splitlines() if line.strip()]
+    if isinstance(records, dict):
+        records = records.get('data', [records])
+    if not isinstance(records, list) or not all(isinstance(record, dict) for record in records):
+        raise ValueError(f'Expected JSON/JSONL records in {path}')
+    return records
+
 def isEM(label, output):
     map_dict = {"true": "yes", "false": "no"}
     if label == output:
@@ -161,30 +165,27 @@ def isEM(label, output):
         return True
 
 if __name__ == "__main__":
-    alias = open("../data/id_aliases.json").readlines()
-    alias = [json.loads(d) for d in alias]
+    alias_path = args.aliases_path or os.path.join(os.path.dirname(__file__), "../data/id_aliases.json")
+    alias = load_records(alias_path) if os.path.isfile(alias_path) else []
     alias_dict = {}
     for d in alias:
         alias_dict[d['Q_id']] = d['aliases']
     if os.path.exists(args.data_path + ".gpteval"):
-        evaluated_res = json.load(open(args.data_path + ".gpteval"))
+        evaluated_res = load_records(args.data_path + ".gpteval")
     else:
         evaluated_res = []
-    try:
-        res = open(args.data_path, 'r', encoding='utf-8').readlines()
-        res = [json.loads(d) for d in res]
-    except:
-        res = json.load(open(args.data_path))
+    res = load_records(args.data_path)
     evaluated_res_dict = {}
     for d in evaluated_res:
-        q = d['question']
-        evaluated_res_dict[q] = d
+        key = (d['question'], d.get('task_type'))
+        evaluated_res_dict[key] = d
     for d in res:
-        q = d['question']
-        if q in evaluated_res_dict:
-            for k, v in evaluated_res_dict[q].items():
-                if k not in d:
-                    d[k] = v
+        key = (d['question'], d.get('task_type'))
+        cached = evaluated_res_dict.get(key)
+        # A cached judgement belongs to a particular prediction, not just a question.
+        if cached and cached.get('final_res') == d.get('final_res'):
+            if not d.get('gpt_eval') and cached.get('gpt_eval'):
+                d['gpt_eval'] = cached['gpt_eval']
     print(len(res))
     not_strict_dict = []
     incorrect = []
@@ -245,11 +246,11 @@ if __name__ == "__main__":
             confidence = 5
         if isinstance(d[answer_key], str) or isinstance(d[answer_key], bool):
             if "dataset" in d and d['dataset'] == "trivia":
-                labels = eval(d[answer_key])
+                labels = ast.literal_eval(d[answer_key])
             else:
                 labels = [str(d[answer_key])]
         else:
-            labels = d[answer_key]
+            labels = list(d[answer_key])
         if "answer_aliases" in d:
             labels.extend(d['answer_aliases'])
         elif "answer_id" in d:
@@ -272,11 +273,8 @@ if __name__ == "__main__":
                 answer_match = True
             else:
                 continue
-        if "gpt_eval" not in d or d['gpt_eval'] == "":
-            prompt_to_ask = prompt_acc.format(question=q, model_output=gpt_answer, answer=labels)
-            all_acc_prompt[q] = prompt_to_ask
-        else:
-            acc_eval[q] = d['gpt_eval']
+        if d.get("gpt_eval"):
+            acc_eval[q] = d["gpt_eval"]
         if strict:
             d['strict'] = True
             strict_num += 1
@@ -289,20 +287,26 @@ if __name__ == "__main__":
         else:
             d['strict'] = False
             d['answer_match'] = False
-        if "gpt_eval" not in d:
+        if not d.get("gpt_eval"):
             if not strict:
                 prompt_to_ask = prompt_acc.format(question=q, model_output=gpt_answer, answer=labels)
                 all_acc_prompt[q] = prompt_to_ask
             else:
-                d["gpt_eval"] = ["yes"]
+                d["gpt_eval"] = "yes"
+                acc_eval[q] = "yes"
         else:
             acc_eval[q] = d['gpt_eval']
        
     if "strategy" not in args.data_path.lower(): 
-        new_acc_eval = get_batch_request(all_acc_prompt, num_workers=50, model_name="gpt-3.5-turbo-1106", num_return=1)
+        new_acc_eval = get_batch_request(all_acc_prompt, num_workers=50, model_name=args.api_model, num_return=1)
+        failed_eval = [q for q, result in new_acc_eval.items() if not result]
+        if failed_eval:
+            raise RuntimeError(f"GPT evaluation failed for {len(failed_eval)} questions; scores were not saved.")
         acc_eval = dict(acc_eval, **new_acc_eval)
         acc_nums = 0
         for d in res:
+            if 'final_res' not in d:
+                continue
             q = d['question']
             if "strict" in d:
                 strict = d["strict"]
@@ -326,9 +330,11 @@ if __name__ == "__main__":
     else:
         acc_nums = strict_num
         
+    if all_nums == 0:
+        raise ValueError("No records with valid final answers to evaluate")
     print(f"Total valid nums: {all_nums}, cEM nums: {nums}, EM nums: {strict_num}, cEM score: {nums / all_nums}, EM score: {strict_num / all_nums}")
     print("GPT evaluation result: ", acc_nums, acc_nums / all_nums)
     result_save_path = args.data_path.split(".json")[0]
-    if len(res) > len(evaluated_res):
-        with open(args.data_path + ".gpteval", 'w', encoding='utf-8') as f:
-            f.write(json.dumps(res, indent=5, ensure_ascii=False))
+    with open(args.data_path + ".gpteval", 'w', encoding='utf-8') as f:
+        f.write(json.dumps(res, indent=5, ensure_ascii=False))
+
